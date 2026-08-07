@@ -1,0 +1,16 @@
+# ufbt build output
+.ufbt/
+build/
+*.o
+*.elf
+
+# host test binaries
+test/host_emv_test
+test/*.dSYM/
+
+# editor / tooling
+.vscode/
+.idea/
+.DS_Store
+__pycache__/
+*.pyc
