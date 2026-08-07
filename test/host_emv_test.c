@@ -14,6 +14,7 @@
 #include "../helpers/emv_card.h"
 #include "../helpers/emv_tlv.h"
 #include "../helpers/leak_grade.h"
+#include "../helpers/report.h"
 
 static int checks = 0;
 static int failures = 0;
@@ -836,6 +837,107 @@ static void test_demo_cards(void) {
     }
 }
 
+/* ---------------------------------------------------------------- expiry */
+
+static void test_expiry(void) {
+    section("Expiry: valid through the whole of its month");
+
+    EmvCard card;
+    emv_card_reset(&card);
+    card.has_expiry = true;
+    card.exp_year = 28; /* 2028 */
+    card.exp_month = 9;
+
+    CHECK(!emv_card_is_expired(&card, 2026, 8), "a 2028 card is not expired in 2026");
+    CHECK(!emv_card_is_expired(&card, 2028, 1), "not expired earlier in the same year");
+    /* A card marked 09/28 is good until the end of September 2028. */
+    CHECK(!emv_card_is_expired(&card, 2028, 9), "expired during its own expiry month");
+    CHECK(emv_card_is_expired(&card, 2028, 10), "not expired the month after");
+    CHECK(emv_card_is_expired(&card, 2029, 1), "not expired the following year");
+
+    /* No readable expiry is never reported as expired — that would be an
+     * invention, and the screen would be stating a fact the card never gave. */
+    emv_card_reset(&card);
+    CHECK(!emv_card_is_expired(&card, 2030, 6), "a card with no expiry was called expired");
+    CHECK(!emv_card_is_expired(NULL, 2030, 6), "NULL card was called expired");
+
+    /* A nonsense clock must not produce a verdict either. */
+    card.has_expiry = true;
+    card.exp_year = 20;
+    card.exp_month = 1;
+    CHECK(!emv_card_is_expired(&card, 2026, 0), "month 0 accepted as a clock");
+    CHECK(!emv_card_is_expired(&card, 2026, 13), "month 13 accepted as a clock");
+}
+
+/* ---------------------------------------------------------------- report */
+
+static void test_report_redaction(void) {
+    section("Report: the full card number never reaches the file");
+
+    EmvCard card;
+    LeakReport r;
+    char buf[MONETA_REPORT_MAX];
+
+    for(size_t i = 0; i < demo_card_count(); i++) {
+        CHECK(demo_card_load(i, &card), "demo card %zu failed to load", i);
+        leak_grade(&card, &r);
+
+        size_t n = report_build(&card, &r, "1.1", "2026-08-07 02:14", buf, sizeof(buf));
+        CHECK(n > 0, "demo %zu produced an empty report", i);
+        CHECK(n < sizeof(buf), "demo %zu report was not terminated in bounds", i);
+        CHECK(strlen(buf) == n, "demo %zu reported a length that is not the string", i);
+
+        if(card.has_pan) {
+            /* The whole promise of the feature, checked rather than asserted. */
+            CHECK(
+                strstr(buf, card.pan) == NULL,
+                "demo %zu leaked the full PAN into the report",
+                i);
+
+            /* The last four are supposed to be there — a report that redacted
+             * everything would pass the test above and be useless. */
+            const char* last4 = card.pan + card.pan_len - 4;
+            CHECK(strstr(buf, last4) != NULL, "demo %zu dropped the last four digits", i);
+
+            /* Nor may any long run of the PAN survive: catches a future edit
+             * that masks only the first few digits. */
+            char chunk[9];
+            for(size_t off = 0; off + 8 <= card.pan_len; off++) {
+                memcpy(chunk, card.pan + off, 8);
+                chunk[8] = '\0';
+                CHECK(
+                    strstr(buf, chunk) == NULL,
+                    "demo %zu leaked 8 consecutive PAN digits at offset %zu",
+                    i,
+                    off);
+            }
+        }
+
+        CHECK(strstr(buf, "grade") != NULL, "demo %zu report has no grade line", i);
+    }
+
+    /* A card that leaked a name must not have the name redacted away — the
+     * report is for the cardholder, and hiding their own name helps nobody. */
+    CHECK(demo_card_load(1, &card), "demo card 1 failed to load");
+    leak_grade(&card, &r);
+    report_build(&card, &r, "1.1", NULL, buf, sizeof(buf));
+    CHECK(strstr(buf, "LEAKED") != NULL, "a leaked cardholder name was not reported");
+
+    /* Truncation must stay in bounds and stay terminated. */
+    char tiny[64];
+    size_t n = report_build(&card, &r, "1.1", "stamp", tiny, sizeof(tiny));
+    CHECK(n < sizeof(tiny), "small buffer overran");
+    CHECK(strlen(tiny) < sizeof(tiny), "small buffer left an unterminated string");
+
+    char one[1];
+    CHECK_UINT(report_build(&card, &r, "1.1", NULL, one, sizeof(one)), 0);
+    CHECK_STR(one, "");
+
+    CHECK_UINT(report_build(NULL, &r, "1.1", NULL, buf, sizeof(buf)), 0);
+    CHECK_UINT(report_build(&card, NULL, "1.1", NULL, buf, sizeof(buf)), 0);
+    CHECK_UINT(report_build(&card, &r, "1.1", NULL, NULL, 0), 0);
+}
+
 /* ------------------------------------------------------------------ main */
 
 int main(void) {
@@ -861,6 +963,8 @@ int main(void) {
     test_grade_bands();
     test_grade_strings();
     test_demo_cards();
+    test_expiry();
+    test_report_redaction();
 
     printf("\n%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;

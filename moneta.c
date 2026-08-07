@@ -12,6 +12,17 @@ void moneta_notify_result(MonetaApp* app, LeakGrade grade) {
     if(app->vibro) {
         notification_message(app->notifications, &sequence_single_vibro);
     }
+
+    /* The LED fires whatever the sound setting is: it is the part of the
+     * verdict that works across a room, and it is silent. */
+    if(grade >= LeakGradeD) {
+        notification_message(app->notifications, &sequence_blink_red_100);
+    } else if(grade >= LeakGradeC) {
+        notification_message(app->notifications, &sequence_blink_yellow_100);
+    } else {
+        notification_message(app->notifications, &sequence_blink_green_100);
+    }
+
     if(!app->sound) return;
 
     if(grade >= LeakGradeD) {
@@ -21,9 +32,27 @@ void moneta_notify_result(MonetaApp* app, LeakGrade grade) {
     }
 }
 
-void moneta_notify_blip(MonetaApp* app) {
+/* Fold the card on screen into the running tally. Demo cards are skipped: a
+ * count that included them would not be a fact about the room. */
+void moneta_session_add(MonetaApp* app) {
     furi_assert(app);
-    if(app->sound) notification_message(app->notifications, &sequence_blink_blue_10);
+    if(app->card.is_demo) return;
+    if(app->session.cards == UINT8_MAX) return;
+
+    app->session.cards++;
+    if(app->report.grade <= LeakGradeF) app->session.by_grade[app->report.grade]++;
+    if(app->report.leaked[LeakFieldName]) app->session.leaked_name++;
+    if(app->report.leaked[LeakFieldLog]) app->session.leaked_log++;
+    if(app->report.cnp_capable) app->session.spendable++;
+    app->session.score_total += app->report.score;
+}
+
+bool moneta_card_expired(const MonetaApp* app) {
+    furi_assert(app);
+
+    DateTime now;
+    furi_hal_rtc_get_datetime(&now);
+    return emv_card_is_expired(&app->card, now.year, now.month);
 }
 
 /* ------------------------------------------------------------ dispatcher */
@@ -94,6 +123,10 @@ static MonetaApp* moneta_app_alloc(void) {
     view_dispatcher_add_view(
         app->view_dispatcher, MonetaViewLesson, lesson_view_get_view(app->lesson_view));
 
+    app->transcript_view = transcript_view_alloc();
+    view_dispatcher_add_view(
+        app->view_dispatcher, MonetaViewTranscript, transcript_view_get_view(app->transcript_view));
+
     app->reader = emv_reader_alloc();
 
     /* Masked by default. An app that left a full card number sitting on a lit
@@ -117,6 +150,7 @@ static void moneta_app_free(MonetaApp* app) {
     view_dispatcher_remove_view(app->view_dispatcher, MonetaViewCard);
     view_dispatcher_remove_view(app->view_dispatcher, MonetaViewLog);
     view_dispatcher_remove_view(app->view_dispatcher, MonetaViewLesson);
+    view_dispatcher_remove_view(app->view_dispatcher, MonetaViewTranscript);
 
     submenu_free(app->submenu);
     widget_free(app->widget);
@@ -125,6 +159,7 @@ static void moneta_app_free(MonetaApp* app) {
     card_view_free(app->card_view);
     log_view_free(app->log_view);
     lesson_view_free(app->lesson_view);
+    transcript_view_free(app->transcript_view);
 
     scene_manager_free(app->scene_manager);
     view_dispatcher_free(app->view_dispatcher);

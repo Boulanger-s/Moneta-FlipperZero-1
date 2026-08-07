@@ -269,6 +269,76 @@ def screen_lesson():
     return img
 
 
+def screen_transcript():
+    """views/transcript_view.c — the actual conversation with the card."""
+    img = new_screen()
+    d = ImageDraw.Draw(img)
+
+    # header: index, label, status word
+    d.rectangle([0, 0, W - 1, 11], fill=LCD_FG)
+    txt(d, 2, 9, "3/9", F_SECONDARY, fill=LCD_BG)
+    txt(d, 26, 9, "SELECT AID", F_SECONDARY, fill=LCD_BG)
+    txt(d, 126, 9, "9000", F_SECONDARY, anchor="rs", fill=LCD_BG)
+
+    ROW_CMD_1, ROW_CMD_2 = 21, 29
+    ROW_RESP_1, ROW_RESP_2, ROW_RESP_3 = 40, 48, 56
+
+    # solid marker = what we sent
+    d.rectangle([0, ROW_CMD_1 - 5, 3, ROW_CMD_1 - 2], fill=LCD_FG)
+    txt(d, 6, ROW_CMD_1, "00 A4 04 00 07 A0 00 00")
+    txt(d, 6, ROW_CMD_2, "00 03 10 10 00")
+
+    # hollow marker = what came back
+    d.rectangle([0, ROW_RESP_1 - 5, 3, ROW_RESP_1 - 2], outline=LCD_FG)
+    txt(d, 6, ROW_RESP_1, "6F 37 84 07 A0 00 00 00")
+    txt(d, 6, ROW_RESP_2, "03 10 10 A5 2C 50 0A 56")
+    txt(d, 6, ROW_RESP_3, "49 53 41 20 44 45 42 49")
+    txt(d, 126, 63, "55 bytes total", F_SECONDARY, anchor="rs")
+    return img
+
+
+def screen_report():
+    """scenes/moneta_scene_report.c — the hub behind the result screen."""
+    img = new_screen()
+    d = ImageDraw.Draw(img)
+
+    txt(d, 64, 10, "Grade D - 61% out", F_PRIMARY, anchor="ms")
+    d.line([0, 13, W - 1, 13], fill=LCD_FG)
+
+    items = ["What leaked", "Card details", "Spending log", "Command transcript"]
+    for i, item in enumerate(items):
+        y = 16 + i * 12
+        if i == 0:
+            d.rounded_rectangle([1, y, W - 2, y + 11], radius=3, fill=LCD_FG)
+            txt(d, 64, y + 9, item, F_PRIMARY, anchor="ms", fill=LCD_BG)
+        else:
+            txt(d, 64, y + 9, item, F_PRIMARY, anchor="ms")
+    return img
+
+
+def screen_tally():
+    """scenes/moneta_scene_tally.c — what the room gave up."""
+    img = new_screen()
+    d = ImageDraw.Draw(img)
+
+    txt(d, 2, 9, "This session", F_PRIMARY)
+    lines = [
+        "Cards read: 9",
+        "Average exposure: 68%",
+        "",
+        "Grades",
+        "F   2  ##",
+        "D   6  ######",
+    ]
+    for i, line in enumerate(lines):
+        font = F_PRIMARY if line == "Grades" else F_SECONDARY
+        txt(d, 2, 20 + i * 8, line, font)
+
+    d.line([126, 12, 126, 63], fill=LCD_FG)
+    d.rectangle([124, 12, 127, 34], fill=LCD_FG)
+    return img
+
+
 # ----------------------------------------------------------------- output
 
 
@@ -291,14 +361,20 @@ SCREENS = [
     ("screen_explain", screen_explain),
     ("screen_log", screen_log),
     ("screen_lesson", screen_lesson),
+    ("screen_transcript", screen_transcript),
+    ("screen_report", screen_report),
+    ("screen_tally", screen_tally),
 ]
 
 STRIP = [
     "screen_idle",
     "screen_reading",
     "screen_result",
-    "screen_fields",
+    "screen_report",
     "screen_log",
+    "screen_transcript",
+    "screen_fields",
+    "screen_tally",
     "screen_lesson",
 ]
 

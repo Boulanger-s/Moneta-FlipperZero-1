@@ -132,11 +132,17 @@ static void panel_limits(Canvas* canvas, uint32_t tick) {
      * and the caption sits on baseline 42, so nothing is drawn through a word
      * — the earlier version put the cross straight across its own label. */
 
-    /* Left: a checkout form, which this leak does enable. */
+    /* Left: a checkout form, which this leak does enable. The tick is always
+     * drawn — blinking it out entirely made the box read as "nothing here" for
+     * half of every cycle, which is the opposite of the point. It thickens on
+     * alternate frames instead, so the eye is pulled to the thing that is
+     * true rather than to the thing that is forbidden. */
     canvas_draw_rframe(canvas, 4, 16, 52, 30, 2);
+    canvas_draw_line(canvas, 16, 27, 22, 33);
+    canvas_draw_line(canvas, 22, 33, 40, 19);
     if((tick / 6) % 2) {
-        canvas_draw_line(canvas, 16, 27, 22, 33);
-        canvas_draw_line(canvas, 22, 33, 40, 19);
+        canvas_draw_line(canvas, 16, 28, 22, 34);
+        canvas_draw_line(canvas, 22, 34, 40, 20);
     }
     canvas_draw_str_aligned(canvas, 30, 42, AlignCenter, AlignBottom, "checkout");
 

@@ -36,6 +36,7 @@ bool moneta_scene_demo_on_event(void* context, SceneManagerEvent event) {
 
     if(demo_card_load(event.event, &app->card)) {
         leak_grade(&app->card, &app->report);
+        memset(&app->transcript, 0, sizeof(app->transcript));
         app->have_card = true;
         moneta_notify_result(app, app->report.grade);
         scene_manager_next_scene(app->scene_manager, MonetaSceneResult);

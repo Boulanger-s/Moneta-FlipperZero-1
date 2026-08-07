@@ -34,7 +34,7 @@ Most of what it answers with is dull. Two fields are not.
 
 ![Moneta screens](images/screens.png)
 
-*Waiting · reading · what it took · the breakdown · your spending log · what it is actually worth*
+*Waiting · reading · what it took · the report · your spending log · the raw conversation · the breakdown · the room · what it is actually worth*
 
 </div>
 
@@ -47,8 +47,11 @@ Most of what it answers with is dull. Two fields are not.
 - **Grades the exposure** from A+ to F, and explains every single field: what it is, what it enables, and what actually stops it.
 - **Reads the spending log**, if your card keeps one. Some do. Date, amount, currency, and the merchant's name.
 - **Names what it cannot get**, which is just as important as what it can.
+- **Shows you the raw conversation** — every command sent and every byte returned — so you never have to take the grade on trust.
+- **Counts the room**. A running tally of every card read this session: how many gave up a number, how many added a name.
+- **Saves a report** to the SD card that records the grade, every field that leaked, and the last four digits — and never the full number.
 
-It never writes to the card. It never emulates one. It never authorises anything. Nothing it reads is written to the SD card, and nothing survives closing the app.
+It never writes to the card. It never emulates one. It never authorises anything. Nothing it reads is written to the SD card unless you ask for a report, and even then the full card number is not in it.
 
 ---
 
@@ -107,6 +110,42 @@ GET DATA 9F36 / 9F17       →  tap counter, PIN tries remaining
 READ RECORD (log SFI)      →  the transaction log, if tags 9F4D and 9F4F admit to one
 ```
 
+Roughly eight commands, about a second, no PIN, no confirmation, and no record left on the card that it happened.
+
+**You can watch all of it.** Every exchange is kept and shown byte for byte under *Command transcript*, with the status word the card answered:
+
+<div align="center">
+
+![Command transcript](images/screen_transcript.png)
+
+</div>
+
+That screen exists for two reasons. Nobody should have to believe a grade they cannot check — and when a card behaves oddly, the person holding it can see why without attaching a debugger.
+
+If the card is a smartcard but has no payment application on it — a transit pass, a DESFire door badge, an ID card — Moneta says exactly that instead of reporting a failed read.
+
+---
+
+## Counting the room
+
+One card is an anecdote. Nine cards out of nine different pockets is a finding.
+
+<div align="center">
+
+![Session tally](images/screen_tally.png)
+
+</div>
+
+The tally counts real reads only — demo cards would make the number a fiction — it is held in RAM, and it is gone the moment you close the app.
+
+---
+
+## Saving a report
+
+*Save report to SD* writes a plain-text summary to `apps_data/moneta/`: the grade, the score, every field that leaked and what each one was worth, the commands sent, and the last four digits of the number.
+
+It does not contain the full card number. That is not a claim, it is [a test](test/host_emv_test.c): the suite builds a report from a card with a known PAN and then searches the output for it, for every eight-digit run of it, and fails if any survives.
+
 Eight commands. About a second. No PIN, no confirmation, no trace on the card that it happened. The reading screen counts them as they go, because the number is part of the argument.
 
 Everything runs over the firmware's ISO-DEP layer (`iso14443_4a_poller_send_block`), on a worker thread, on the internal NFC hardware. **No add-on board of any kind is required.**
@@ -150,9 +189,22 @@ The BER-TLV parser eats attacker-controlled bytes off a radio, and the grade is 
 make -C test
 ```
 
-335 checks over the TLV reader (including truncated, runaway and over-nested input), Luhn, Track 2, every scheme prefix, the log parser, and every grade boundary and floor rule — compiled with `-Werror` and the address and undefined-behaviour sanitisers, and run on every push.
+390 checks over the TLV reader (including truncated, runaway and over-nested input), Luhn, Track 2, every scheme prefix, the log parser, every grade boundary and floor rule, the expiry logic, and the promise that a saved report never contains the full card number — compiled with `-Werror` and the address and undefined-behaviour sanitisers, and run on every push.
 
 The screen mock-ups in `images/` are generated from the same layout constants the views use ([`tools_gen_mockups.py`](tools_gen_mockups.py)), which is how three text-overflow bugs got caught before this shipped.
+
+---
+
+## What changed in 1.1
+
+- **Command transcript.** Every APDU and every response, byte for byte, with the status word. Check the grade against the evidence, or diagnose an unusual card in the field.
+- **Card details.** AID, all applications on the card, issuer country, currency, service code, tap counter, PIN tries remaining, and whether the printed expiry has already passed.
+- **Session tally.** How many cards this Flipper has read since the app opened, and how many of them handed over enough to spend.
+- **Reports to SD.** Redacted by construction and by test.
+- **Honest failure.** An ISO-DEP smartcard with no payment application is now reported as exactly that, instead of being mistaken for a card that moved away mid-read.
+- **Expired cards.** Flagged on the result screen — the chip does not stop answering on the date printed on the front.
+
+Fixed since 1.0: a 19-digit card number ran one pixel past the edge of the drawn card; the response buffers used by the EMV conversation sat on the NFC poller's stack rather than the heap; a card whose preferred-name tag was all spaces lost its product label instead of falling back; and the command counter only advanced at step boundaries instead of live.
 
 ---
 

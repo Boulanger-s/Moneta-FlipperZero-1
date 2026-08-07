@@ -36,6 +36,7 @@ typedef struct {
     bool has_card;
     bool revealed;
     bool reveal_allowed;
+    bool expired;
     uint32_t tick;
 } CardViewModel;
 
@@ -74,8 +75,13 @@ static void draw_masked_pan(Canvas* canvas, const EmvCard* card) {
     size_t hidden = pan_len - 4;
 
     /* Fit the dots into whatever is left after the last four digits. A
-     * 19-digit Maestro number needs tighter spacing than a 16-digit Visa. */
-    int avail = CARD_W - (PAN_LEFT - CARD_X) - LAST4_WIDTH - 8;
+     * 19-digit Maestro number needs tighter spacing than a 16-digit Visa.
+     *
+     * The group gaps have to come out of the budget too: at 19 digits there
+     * are three of them, and leaving them out ran the last four digits past
+     * the edge of the card. */
+    int groups = (int)((hidden - 1) / 4); /* gaps between groups of four */
+    int avail = CARD_W - (PAN_LEFT - CARD_X) - LAST4_WIDTH - GROUP_GAP * (groups + 1) - 4;
     int spacing = avail / (int)hidden;
     if(spacing > DOT_MAX_SPACING) spacing = DOT_MAX_SPACING;
     if(spacing < DOT_MIN_SPACING) spacing = DOT_MIN_SPACING;
@@ -169,7 +175,15 @@ static void card_view_draw(Canvas* canvas, void* model) {
     snprintf(expline, sizeof(expline), "EXP %s", exp);
     canvas_draw_str(canvas, PAN_LEFT - 2, 43, expline);
 
-    if(c->has_name) {
+    /* The right-hand end of the expiry row holds exactly one thing.
+     *
+     * An expired card still answers every question it ever did — the chip does
+     * not stop talking on the date printed on the front — so that warning wins
+     * the space when it applies. The cardholder name is not lost by giving way
+     * here: it is listed, weighted and explained under "What leaked". */
+    if(m->expired) {
+        canvas_draw_str_aligned(canvas, 122, 43, AlignRight, AlignBottom, "EXPIRED");
+    } else if(c->has_name) {
         char name[MONETA_NAME_MAX + 1];
         strncpy(name, c->name, sizeof(name) - 1);
         name[sizeof(name) - 1] = '\0';
@@ -283,6 +297,12 @@ void card_view_set_reveal_allowed(CardView* view, bool allowed) {
             if(!allowed) m->revealed = false;
         },
         true);
+}
+
+void card_view_set_expired(CardView* view, bool expired) {
+    furi_assert(view);
+    with_view_model(
+        view->view, CardViewModel * m, { m->expired = expired; }, true);
 }
 
 void card_view_tick(CardView* view) {

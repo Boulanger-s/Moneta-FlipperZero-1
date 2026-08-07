@@ -34,7 +34,9 @@ bool moneta_scene_scan_on_event(void* context, SceneManagerEvent event) {
         if(progress.state == EmvReaderDone && !app->have_card) {
             if(emv_reader_get_card(app->reader, &app->card)) {
                 leak_grade(&app->card, &app->report);
+                emv_reader_get_transcript(app->reader, &app->transcript);
                 app->have_card = true;
+                moneta_session_add(app);
                 view_dispatcher_send_custom_event(
                     app->view_dispatcher, MonetaCustomEventCardRead);
             }

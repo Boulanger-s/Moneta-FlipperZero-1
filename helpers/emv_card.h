@@ -163,6 +163,12 @@ const char* emv_currency_name(uint16_t code);
 /* Luhn (ISO/IEC 7812) check digit over an ASCII digit string. */
 bool emv_luhn_check(const char* digits, size_t len);
 
+/* True when the card's printed expiry has already passed. `now_year` is the
+ * full year (2026), `now_month` is 1-12. The clock is a parameter rather than
+ * a call, so this file stays free of any platform. A card with no readable
+ * expiry is never reported as expired. */
+bool emv_card_is_expired(const EmvCard* card, uint16_t now_year, uint8_t now_month);
+
 /* Scheme from the AID, which is authoritative, falling back to the PAN's
  * issuer identification number when no AID was captured. */
 EmvScheme emv_scheme_from_aid(const uint8_t* aid, size_t aid_len);

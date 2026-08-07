@@ -5,6 +5,7 @@ typedef enum {
     StartItemLesson,
     StartItemSafe,
     StartItemDemo,
+    StartItemTally,
     StartItemSettings,
     StartItemAbout,
 } StartItem;
@@ -24,6 +25,7 @@ void moneta_scene_start_on_enter(void* context) {
     submenu_add_item(menu, "What a skimmer gets", StartItemLesson, start_submenu_cb, app);
     submenu_add_item(menu, "What it cannot get", StartItemSafe, start_submenu_cb, app);
     submenu_add_item(menu, "Demo cards", StartItemDemo, start_submenu_cb, app);
+    submenu_add_item(menu, "This session", StartItemTally, start_submenu_cb, app);
     submenu_add_item(menu, "Settings", StartItemSettings, start_submenu_cb, app);
     submenu_add_item(menu, "About", StartItemAbout, start_submenu_cb, app);
 
@@ -52,6 +54,9 @@ bool moneta_scene_start_on_event(void* context, SceneManagerEvent event) {
         return true;
     case StartItemDemo:
         scene_manager_next_scene(app->scene_manager, MonetaSceneDemo);
+        return true;
+    case StartItemTally:
+        scene_manager_next_scene(app->scene_manager, MonetaSceneTally);
         return true;
     case StartItemSettings:
         scene_manager_next_scene(app->scene_manager, MonetaSceneSettings);

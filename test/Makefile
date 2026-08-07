@@ -17,13 +17,15 @@ SRC := host_emv_test.c \
        ../helpers/emv_tlv.c \
        ../helpers/emv_card.c \
        ../helpers/leak_grade.c \
-       ../helpers/demo_card.c
+       ../helpers/demo_card.c \
+       ../helpers/report.c
 
 DEPS := ../helpers/emv_tlv.h \
         ../helpers/emv_card.h \
         ../helpers/leak_grade.h \
         ../helpers/demo_card.h \
-        ../helpers/demo_card_data.h
+        ../helpers/demo_card_data.h \
+        ../helpers/report.h
 
 BIN := host_emv_test
 

@@ -418,16 +418,18 @@ bool emv_card_ingest_tlv(EmvCard* card, const uint8_t* buf, size_t len) {
 
     if(!card->has_label) {
         /* 9F12 is the issuer's preferred, localised name; 50 is the generic
-         * label. Prefer the specific one. */
+         * label. Prefer the specific one — but a 9F12 that trims away to
+         * nothing must not stop us falling back to 50, which is what happens
+         * on cards that pad the preferred name with spaces. */
         if(emv_tlv_find(buf, len, TAG_PREF_NAME, &tlv) && tlv.length > 0) {
             str_copy_trimmed(card->label, sizeof(card->label), tlv.value, tlv.length);
             card->has_label = card->label[0] != '\0';
-            gained = gained || card->has_label;
-        } else if(emv_tlv_find(buf, len, TAG_LABEL, &tlv) && tlv.length > 0) {
+        }
+        if(!card->has_label && emv_tlv_find(buf, len, TAG_LABEL, &tlv) && tlv.length > 0) {
             str_copy_trimmed(card->label, sizeof(card->label), tlv.value, tlv.length);
             card->has_label = card->label[0] != '\0';
-            gained = gained || card->has_label;
         }
+        gained = gained || card->has_label;
     }
 
     if(!card->has_country && emv_tlv_find(buf, len, TAG_COUNTRY, &tlv) && tlv.length >= 2) {
@@ -672,6 +674,20 @@ void emv_card_format_pan(const EmvCard* card, char* out, size_t out_len) {
 
 void emv_card_format_pan_masked(const EmvCard* card, char* out, size_t out_len) {
     format_pan_impl(card, out, out_len, true);
+}
+
+bool emv_card_is_expired(const EmvCard* card, uint16_t now_year, uint8_t now_month) {
+    if(card == NULL || !card->has_expiry) return false;
+    if(now_month < 1 || now_month > 12) return false;
+
+    /* Cards store two digits. Payment cards are issued for a handful of years,
+     * never for eighty, so a two-digit year always means this century for any
+     * card a person is carrying today. */
+    uint16_t card_year = (uint16_t)(2000 + card->exp_year);
+
+    /* The card is valid through the whole of its expiry month. */
+    if(card_year != now_year) return card_year < now_year;
+    return card->exp_month < now_month;
 }
 
 void emv_card_format_expiry(const EmvCard* card, char* out, size_t out_len) {

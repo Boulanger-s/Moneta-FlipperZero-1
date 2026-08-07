@@ -18,7 +18,6 @@
 #define APDU_CMD_MAX 64u
 #define POLL_MS 20u
 
-/* The card's own answers, in the order a terminal asks for them. */
 #define SW_OK 0x9000u
 
 struct EmvReader {
@@ -41,12 +40,25 @@ struct EmvReader {
     /* published */
     EmvReaderProgress progress;
     EmvCard card;
+    EmvTranscript transcript;
     bool card_ready;
 
-    /* scratch, owned by the poller callback */
+    /* Scratch owned by the poller callback.
+     *
+     * These live here rather than on the stack because the EMV conversation
+     * runs on the NFC poller's own thread, whose stack we do not control. A
+     * few hundred bytes of response buffer is not something to gamble on
+     * somebody else's stack budget. */
     EmvCard building;
     EmvReaderProgress building_progress;
+    EmvTranscript building_trx;
     uint8_t resp[APDU_RESP_MAX];
+    uint8_t fci[APDU_RESP_MAX];
+    uint8_t aid[MONETA_AID_MAX];
+    uint8_t pdol[64];
+    uint8_t afl[64];
+    uint8_t log_fmt[64];
+    uint8_t cmd[APDU_CMD_MAX];
 };
 
 static void rd_lock(EmvReader* r) {
@@ -62,6 +74,41 @@ static void publish_progress(EmvReader* r, EmvReaderState state) {
     rd_lock(r);
     r->progress = r->building_progress;
     rd_unlock(r);
+}
+
+/* ------------------------------------------------------------ transcript */
+
+static void trx_reset(EmvTranscript* t) {
+    memset(t, 0, sizeof(*t));
+}
+
+static EmvApduEntry* trx_begin(EmvTranscript* t, const char* label) {
+    if(t->num >= MONETA_TRX_MAX) {
+        t->truncated = true;
+        return NULL;
+    }
+    EmvApduEntry* e = &t->entry[t->num++];
+    memset(e, 0, sizeof(*e));
+    strncpy(e->label, label, MONETA_TRX_LABEL_MAX);
+    e->label[MONETA_TRX_LABEL_MAX] = '\0';
+    return e;
+}
+
+static void trx_record_cmd(EmvApduEntry* e, const uint8_t* cmd, size_t len) {
+    if(e == NULL) return;
+    e->cmd_len = (uint8_t)(len > 255 ? 255 : len);
+    size_t keep = len > MONETA_TRX_CMD_MAX ? MONETA_TRX_CMD_MAX : len;
+    memcpy(e->cmd, cmd, keep);
+    e->cmd_stored = (uint8_t)keep;
+}
+
+static void trx_record_resp(EmvApduEntry* e, const uint8_t* body, size_t len, uint16_t sw) {
+    if(e == NULL) return;
+    e->resp_len = (uint16_t)len;
+    size_t keep = len > MONETA_TRX_RESP_MAX ? MONETA_TRX_RESP_MAX : len;
+    memcpy(e->resp, body, keep);
+    e->resp_stored = (uint8_t)keep;
+    e->sw = sw;
 }
 
 /* ------------------------------------------------------------------ APDU */
@@ -80,12 +127,15 @@ static bool apdu_exchange(
     BitBuffer* rx,
     const uint8_t* cmd,
     size_t cmd_len,
+    const char* label,
     size_t* out_len,
     uint16_t* out_sw) {
     if(cmd_len == 0 || cmd_len > APDU_CMD_MAX) return false;
 
-    uint8_t local[APDU_CMD_MAX];
-    memcpy(local, cmd, cmd_len);
+    EmvApduEntry* entry = trx_begin(&r->building_trx, label);
+    trx_record_cmd(entry, cmd, cmd_len);
+
+    memcpy(r->cmd, cmd, cmd_len);
 
     *out_len = 0;
     *out_sw = 0;
@@ -93,14 +143,23 @@ static bool apdu_exchange(
     for(uint8_t attempt = 0; attempt < 3; attempt++) {
         bit_buffer_reset(tx);
         bit_buffer_reset(rx);
-        bit_buffer_copy_bytes(tx, local, cmd_len);
+        bit_buffer_copy_bytes(tx, r->cmd, cmd_len);
 
         if(r->building_progress.apdus < 255) r->building_progress.apdus++;
+        /* Publish on every command, so the counter on screen ticks live rather
+         * than jumping at step boundaries. */
+        publish_progress(r, r->building_progress.state);
 
-        if(iso14443_4a_poller_send_block(poller, tx, rx) != Iso14443_4aErrorNone) return false;
+        if(iso14443_4a_poller_send_block(poller, tx, rx) != Iso14443_4aErrorNone) {
+            if(entry) entry->failed = true;
+            return false;
+        }
 
         size_t n = bit_buffer_get_size_bytes(rx);
-        if(n < 2) return false;
+        if(n < 2) {
+            if(entry) entry->failed = true;
+            return false;
+        }
 
         uint8_t sw1 = bit_buffer_get_byte(rx, n - 2);
         uint8_t sw2 = bit_buffer_get_byte(rx, n - 1);
@@ -108,17 +167,17 @@ static bool apdu_exchange(
 
         if(sw1 == 0x61) {
             /* The body is empty and sw2 says how much is waiting. */
-            local[0] = 0x00;
-            local[1] = 0xC0; /* GET RESPONSE */
-            local[2] = 0x00;
-            local[3] = 0x00;
-            local[4] = sw2;
+            r->cmd[0] = 0x00;
+            r->cmd[1] = 0xC0; /* GET RESPONSE */
+            r->cmd[2] = 0x00;
+            r->cmd[3] = 0x00;
+            r->cmd[4] = sw2;
             cmd_len = 5;
             continue;
         }
         if(sw1 == 0x6C) {
             /* Re-issue the same command with the length the card wants. */
-            local[cmd_len - 1] = sw2;
+            r->cmd[cmd_len - 1] = sw2;
             continue;
         }
 
@@ -126,10 +185,14 @@ static bool apdu_exchange(
         const uint8_t* data = bit_buffer_get_data(rx);
         memcpy(r->resp, data, body);
 
+        trx_record_resp(entry, r->resp, body, (uint16_t)((sw1 << 8) | sw2));
+
         *out_len = body;
         *out_sw = (uint16_t)((sw1 << 8) | sw2);
         return true;
     }
+
+    if(entry) entry->failed = true;
     return false;
 }
 
@@ -141,6 +204,7 @@ static bool select_by_name(
     BitBuffer* rx,
     const uint8_t* name,
     size_t name_len,
+    const char* label,
     size_t* out_len) {
     if(name_len == 0 || name_len > 16) return false;
 
@@ -154,7 +218,7 @@ static bool select_by_name(
     cmd[5 + name_len] = 0x00; /* Le */
 
     uint16_t sw = 0;
-    if(!apdu_exchange(r, poller, tx, rx, cmd, name_len + 6, out_len, &sw)) return false;
+    if(!apdu_exchange(r, poller, tx, rx, cmd, name_len + 6, label, out_len, &sw)) return false;
     return sw == SW_OK && *out_len > 0;
 }
 
@@ -262,7 +326,9 @@ static bool get_processing_options(
     cmd[7 + data_len] = 0x00; /* Le */
 
     uint16_t sw = 0;
-    if(!apdu_exchange(r, poller, tx, rx, cmd, data_len + 8, out_len, &sw)) return false;
+    if(!apdu_exchange(r, poller, tx, rx, cmd, data_len + 8, "GET OPTIONS", out_len, &sw)) {
+        return false;
+    }
     return sw == SW_OK && *out_len > 0;
 }
 
@@ -281,8 +347,11 @@ static bool read_record(
     cmd[3] = (uint8_t)((sfi << 3) | 0x04u); /* P2: read record `record` in `sfi` */
     cmd[4] = 0x00;
 
+    char label[MONETA_TRX_LABEL_MAX + 1];
+    snprintf(label, sizeof(label), "READ %u/%u", (unsigned)sfi, (unsigned)record);
+
     uint16_t sw = 0;
-    if(!apdu_exchange(r, poller, tx, rx, cmd, sizeof(cmd), out_len, &sw)) return false;
+    if(!apdu_exchange(r, poller, tx, rx, cmd, sizeof(cmd), label, out_len, &sw)) return false;
     return sw == SW_OK && *out_len > 0;
 }
 
@@ -300,8 +369,11 @@ static bool get_data(
     cmd[3] = (uint8_t)(tag & 0xFF);
     cmd[4] = 0x00;
 
+    char label[MONETA_TRX_LABEL_MAX + 1];
+    snprintf(label, sizeof(label), "GET %04X", tag);
+
     uint16_t sw = 0;
-    if(!apdu_exchange(r, poller, tx, rx, cmd, sizeof(cmd), out_len, &sw)) return false;
+    if(!apdu_exchange(r, poller, tx, rx, cmd, sizeof(cmd), label, out_len, &sw)) return false;
     return sw == SW_OK && *out_len > 0;
 }
 
@@ -314,13 +386,16 @@ static const uint8_t PPSE_NAME[] = "2PAY.SYS.DDF01";
 static const struct {
     uint8_t aid[7];
     uint8_t len;
+    const char* label;
 } FALLBACK_AIDS[] = {
-    {{0xA0, 0x00, 0x00, 0x00, 0x03, 0x10, 0x10}, 7}, /* Visa */
-    {{0xA0, 0x00, 0x00, 0x00, 0x04, 0x10, 0x10}, 7}, /* Mastercard */
-    {{0xA0, 0x00, 0x00, 0x00, 0x25, 0x01, 0x00}, 6}, /* Amex */
-    {{0xA0, 0x00, 0x00, 0x03, 0x33, 0x01, 0x01}, 7}, /* UnionPay */
-    {{0xA0, 0x00, 0x00, 0x00, 0x65, 0x10, 0x10}, 7}, /* JCB */
-    {{0xA0, 0x00, 0x00, 0x05, 0x24, 0x10, 0x10}, 7}, /* RuPay */
+    {{0xA0, 0x00, 0x00, 0x00, 0x03, 0x10, 0x10}, 7, "TRY Visa"},
+    {{0xA0, 0x00, 0x00, 0x00, 0x04, 0x10, 0x10}, 7, "TRY MC"},
+    {{0xA0, 0x00, 0x00, 0x00, 0x25, 0x01, 0x00}, 6, "TRY Amex"},
+    {{0xA0, 0x00, 0x00, 0x03, 0x33, 0x01, 0x01}, 7, "TRY UnionPay"},
+    {{0xA0, 0x00, 0x00, 0x00, 0x65, 0x10, 0x10}, 7, "TRY JCB"},
+    {{0xA0, 0x00, 0x00, 0x05, 0x24, 0x10, 0x10}, 7, "TRY RuPay"},
+    {{0xA0, 0x00, 0x00, 0x00, 0x04, 0x30, 0x60}, 7, "TRY Maestro"},
+    {{0xA0, 0x00, 0x00, 0x01, 0x52, 0x30, 0x10}, 7, "TRY Discover"},
 };
 
 /* Read the transaction log, when the card admits to keeping one. Tag 9F4D
@@ -347,7 +422,7 @@ static void read_transaction_log(
             if(emv_tlv_find(r->resp, n, 0x9F4D, &tlv) && tlv.length >= 2) {
                 log_sfi = tlv.value[0];
                 log_count = tlv.value[1];
-            } else if(n >= 2) {
+            } else {
                 log_sfi = r->resp[0];
                 log_count = r->resp[1];
             }
@@ -356,12 +431,12 @@ static void read_transaction_log(
 
     if(log_sfi == 0 || log_count == 0) return;
 
-    uint8_t fmt[64];
     size_t fmt_len = 0;
     size_t n = 0;
     if(get_data(r, poller, tx, rx, 0x9F4F, &n) && n > 0) {
-        if(emv_tlv_find(r->resp, n, 0x9F4F, &tlv) && tlv.length > 0 && tlv.length <= sizeof(fmt)) {
-            memcpy(fmt, tlv.value, tlv.length);
+        if(emv_tlv_find(r->resp, n, 0x9F4F, &tlv) && tlv.length > 0 &&
+           tlv.length <= sizeof(r->log_fmt)) {
+            memcpy(r->log_fmt, tlv.value, tlv.length);
             fmt_len = tlv.length;
         }
     }
@@ -373,37 +448,45 @@ static void read_transaction_log(
     for(uint8_t rec = 1; rec <= log_count && !r->stop; rec++) {
         size_t len = 0;
         if(!read_record(r, poller, tx, rx, log_sfi, rec, &len)) continue;
-        if(emv_card_ingest_log_record(&r->building, fmt, fmt_len, r->resp, len)) {
+        if(emv_card_ingest_log_record(&r->building, r->log_fmt, fmt_len, r->resp, len)) {
             r->building_progress.log_entries = r->building.log_num;
             publish_progress(r, EmvReaderReadingLog);
         }
     }
 }
 
+/* How the read ended, so the scan screen can say something true about it. */
+typedef enum {
+    SessionOk,
+    SessionNoPayApp, /* ISO-DEP, but nothing that pays */
+    SessionLost, /* the card stopped answering partway */
+} SessionResult;
+
 /* The whole read, start to finish. Runs inside the poller callback, which is
  * the only context where talking to the card is legal. */
-static bool run_emv_session(EmvReader* r, Iso14443_4aPoller* poller) {
+static SessionResult run_emv_session(EmvReader* r, Iso14443_4aPoller* poller) {
     BitBuffer* tx = bit_buffer_alloc(APDU_CMD_MAX);
     BitBuffer* rx = bit_buffer_alloc(APDU_RESP_MAX);
-    bool got_anything = false;
 
     emv_card_reset(&r->building);
     memset(&r->building_progress, 0, sizeof(r->building_progress));
+    trx_reset(&r->building_trx);
 
-    uint8_t aid[MONETA_AID_MAX];
     size_t aid_len = 0;
+    SessionResult result = SessionLost;
 
     do {
         /* 1. Ask the card what it can pay with. */
         publish_progress(r, EmvReaderSelecting);
         size_t len = 0;
-        if(select_by_name(r, poller, tx, rx, PPSE_NAME, sizeof(PPSE_NAME) - 1, &len)) {
+        if(select_by_name(
+               r, poller, tx, rx, PPSE_NAME, sizeof(PPSE_NAME) - 1, "SELECT PPSE", &len)) {
             emv_card_ingest_ppse(&r->building, r->resp, len);
         }
 
         if(r->building.app_num > 0) {
             aid_len = r->building.apps[0].aid_len;
-            memcpy(aid, r->building.apps[0].aid, aid_len);
+            memcpy(r->aid, r->building.apps[0].aid, aid_len);
         }
 
         /* 2. No directory? Knock on the doors we know the names of. */
@@ -411,53 +494,65 @@ static bool run_emv_session(EmvReader* r, Iso14443_4aPoller* poller) {
             for(size_t i = 0; i < sizeof(FALLBACK_AIDS) / sizeof(FALLBACK_AIDS[0]); i++) {
                 if(r->stop) break;
                 if(select_by_name(
-                       r, poller, tx, rx, FALLBACK_AIDS[i].aid, FALLBACK_AIDS[i].len, &len)) {
+                       r,
+                       poller,
+                       tx,
+                       rx,
+                       FALLBACK_AIDS[i].aid,
+                       FALLBACK_AIDS[i].len,
+                       FALLBACK_AIDS[i].label,
+                       &len)) {
                     aid_len = FALLBACK_AIDS[i].len;
-                    memcpy(aid, FALLBACK_AIDS[i].aid, aid_len);
+                    memcpy(r->aid, FALLBACK_AIDS[i].aid, aid_len);
                     break;
                 }
             }
-            if(aid_len == 0) break; /* answered ISO-DEP, but pays for nothing */
+            if(aid_len == 0) {
+                /* It answered ISO-DEP but pays for nothing — a transit card, a
+                 * DESFire badge, an ID card. That is a real answer, not a
+                 * failure, and the user deserves to be told which. */
+                result = SessionNoPayApp;
+                break;
+            }
         }
 
         /* 3. Open the application. Its FCI carries the label, and the list of
          *    values the card wants from the terminal before it will talk. */
         publish_progress(r, EmvReaderOpeningApp);
-        if(!select_by_name(r, poller, tx, rx, aid, aid_len, &len)) break;
+        if(!select_by_name(r, poller, tx, rx, r->aid, aid_len, "SELECT AID", &len)) break;
 
-        uint8_t fci[APDU_RESP_MAX];
         size_t fci_len = len;
-        memcpy(fci, r->resp, fci_len);
-        emv_card_ingest_tlv(&r->building, fci, fci_len);
-        got_anything = true;
+        memcpy(r->fci, r->resp, fci_len);
+        emv_card_ingest_tlv(&r->building, r->fci, fci_len);
+        /* From here on the card has told us something real, so a card that
+         * walks away mid-read still leaves a usable result on screen. */
+        result = SessionOk;
 
-        uint8_t pdol[64];
         size_t pdol_len = 0;
         EmvTlv tlv;
-        if(emv_tlv_find(fci, fci_len, 0x9F38, &tlv) && tlv.length <= sizeof(pdol)) {
-            memcpy(pdol, tlv.value, tlv.length);
+        if(emv_tlv_find(r->fci, fci_len, 0x9F38, &tlv) && tlv.length <= sizeof(r->pdol)) {
+            memcpy(r->pdol, tlv.value, tlv.length);
             pdol_len = tlv.length;
         }
 
         /* 4. Processing options. The answer contains the Application File
          *    Locator: which files hold the card's data, and which records. */
-        if(!get_processing_options(r, poller, tx, rx, pdol, pdol_len, &len)) break;
+        if(!get_processing_options(r, poller, tx, rx, r->pdol, pdol_len, &len)) break;
 
-        uint8_t afl[64];
         size_t afl_len = 0;
         emv_card_ingest_tlv(&r->building, r->resp, len);
 
         if(emv_tlv_find(r->resp, len, 0x94, &tlv)) {
             /* Format 2: the AFL is tagged inside a 77 template. */
-            if(tlv.length <= sizeof(afl)) {
-                memcpy(afl, tlv.value, tlv.length);
+            if(tlv.length <= sizeof(r->afl)) {
+                memcpy(r->afl, tlv.value, tlv.length);
                 afl_len = tlv.length;
             }
         } else if(emv_tlv_find(r->resp, len, 0x80, &tlv) && tlv.length > 2) {
             /* Format 1: a bare 80 template, two bytes of AIP then the AFL. */
             afl_len = tlv.length - 2;
-            if(afl_len > sizeof(afl)) afl_len = sizeof(afl);
-            memcpy(afl, tlv.value + 2, afl_len);
+            if(afl_len > sizeof(r->afl)) afl_len = sizeof(r->afl);
+            memcpy(r->afl, tlv.value + 2, afl_len);
         }
 
         /* 5. Read what the locator points at. This is the step that produces
@@ -465,9 +560,9 @@ static bool run_emv_session(EmvReader* r, Iso14443_4aPoller* poller) {
         publish_progress(r, EmvReaderReadingRecords);
         for(size_t i = 0; i + 3 < afl_len; i += 4) {
             if(r->stop) break;
-            uint8_t sfi = afl[i] >> 3;
-            uint8_t first = afl[i + 1];
-            uint8_t last = afl[i + 2];
+            uint8_t sfi = r->afl[i] >> 3;
+            uint8_t first = r->afl[i + 1];
+            uint8_t last = r->afl[i + 2];
             if(sfi == 0 || sfi == 31 || first == 0 || last < first) continue;
             if(last - first > 16) last = first + 16; /* a sane bound on a hostile AFL */
 
@@ -496,14 +591,14 @@ static bool run_emv_session(EmvReader* r, Iso14443_4aPoller* poller) {
             }
         }
 
-        if(!r->stop) read_transaction_log(r, poller, tx, rx, fci, fci_len);
+        if(!r->stop) read_transaction_log(r, poller, tx, rx, r->fci, fci_len);
     } while(0);
 
     bit_buffer_free(tx);
     bit_buffer_free(rx);
 
     r->building.apdu_count = r->building_progress.apdus;
-    return got_anything;
+    return result;
 }
 
 /* -------------------------------------------------------------- callbacks */
@@ -527,13 +622,16 @@ static NfcCommand poller_cb(NfcGenericEvent event, void* context) {
     const Iso14443_4aPollerEvent* ev = event.event_data;
 
     if(ev->type == Iso14443_4aPollerEventTypeReady) {
-        bool ok = run_emv_session(r, (Iso14443_4aPoller*)event.instance);
+        SessionResult res = run_emv_session(r, (Iso14443_4aPoller*)event.instance);
 
         rd_lock(r);
-        r->poll_ok = ok;
-        if(ok) {
+        r->poll_ok = (res == SessionOk);
+        r->transcript = r->building_trx;
+        if(res == SessionOk) {
             r->card = r->building;
             r->card_ready = true;
+        } else if(res == SessionNoPayApp) {
+            r->progress.state = EmvReaderNoPayApp;
         }
         rd_unlock(r);
 
@@ -608,6 +706,10 @@ static NfcProtocol stack_top(const NfcProtocol* stack, size_t num) {
     return top;
 }
 
+static void hold_verdict(EmvReader* r, int ticks) {
+    for(int i = 0; i < ticks && !r->stop; i++) furi_delay_ms(POLL_MS);
+}
+
 static int32_t reader_worker(void* context) {
     EmvReader* r = context;
 
@@ -646,7 +748,7 @@ static int32_t reader_worker(void* context) {
             rd_unlock(r);
             /* Hold the verdict on screen rather than instantly re-scanning the
              * same card and flickering between two messages. */
-            for(int i = 0; i < 60 && !r->stop; i++) furi_delay_ms(POLL_MS);
+            hold_verdict(r, 60);
             continue;
         }
 
@@ -663,12 +765,15 @@ static int32_t reader_worker(void* context) {
 
         rd_lock(r);
         bool done = r->card_ready;
-        r->progress.state = done ? EmvReaderDone : EmvReaderLost;
+        bool no_pay_app = (r->progress.state == EmvReaderNoPayApp);
+        if(done) r->progress.state = EmvReaderDone;
+        else if(!no_pay_app) r->progress.state = EmvReaderLost;
         rd_unlock(r);
 
         if(done) break;
-        /* The card moved away mid-read. Say so, then go back to looking. */
-        for(int i = 0; i < 30 && !r->stop; i++) furi_delay_ms(POLL_MS);
+        /* Either it was a smartcard that does not pay, or it moved away
+         * mid-read. Say which, then go back to looking. */
+        hold_verdict(r, no_pay_app ? 90 : 30);
     }
 
     nfc_free(r->nfc);
@@ -690,6 +795,9 @@ void emv_reader_free(EmvReader* r) {
     furi_assert(r);
     emv_reader_stop(r);
     furi_mutex_free(r->mutex);
+    /* A card number passed through this struct. Do not hand the heap back
+     * with one still in it. */
+    memset(r, 0, sizeof(EmvReader));
     free(r);
 }
 
@@ -703,6 +811,7 @@ void emv_reader_start(EmvReader* r) {
     r->progress.state = EmvReaderSearching;
     r->card_ready = false;
     emv_card_reset(&r->card);
+    trx_reset(&r->transcript);
     rd_unlock(r);
 
     r->thread = furi_thread_alloc_ex("MonetaReader", 4 * 1024, reader_worker, r);
@@ -735,4 +844,12 @@ bool emv_reader_get_card(EmvReader* r, EmvCard* out) {
     if(ready) *out = r->card;
     rd_unlock(r);
     return ready;
+}
+
+void emv_reader_get_transcript(EmvReader* r, EmvTranscript* out) {
+    furi_assert(r);
+    furi_assert(out);
+    rd_lock(r);
+    *out = r->transcript;
+    rd_unlock(r);
 }
